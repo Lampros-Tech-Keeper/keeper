@@ -1,72 +1,107 @@
 package main
 
 import (
-	"encoding/json"
-	"io"
-	"log"
-	"net/http"
-	"os/exec"
+    "context"
+    "crypto/ecdsa"
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "math/big"
+    "net/http"
+    "os"
+    "time"
+    "bytes"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/crypto"
+    "github.com/ethereum/go-ethereum/ethclient"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/joho/godotenv"
+    blst "github.com/supranational/blst/bindings/go"
+    "github.com/Keeper-network-2/keeper/keeper"
+    "github.com/Keeper-network-2/keeper/aggregator"
+    /* "github.com/yourorg/yourproject/logging"
+    "github.com/yourorg/yourproject/metrics" */
 )
 
 type JobCreatedEvent struct {
-	JobID          uint32 `json:"jobID"`
-	JobType        string `json:"jobType"`
-	JobDescription string `json:"jobDescription"`
-	JobURL         string `json:"jobURL"`
+    JobID          uint32 `json:"jobID"`
+    JobType        string `json:"jobType"`
+    JobDescription string `json:"jobDescription"`
+    JobURL         string `json:"jobURL"`
 }
 
+var rpcClient *operator.AggregatorRpcClient
+
 func main() {
-	http.HandleFunc("/executeTask", executeTaskHandler)
-	log.Println("Starting operator server on port 8081...")
-	log.Fatal(http.ListenAndServe(":8081", nil))
+    // Load environment variables from .env file
+    err := godotenv.Load()
+    if (err != nil) {
+        log.Fatal("Error loading .env file")
+    }
+
+    aggregatorIpPortAddr := os.Getenv("AGGREGATOR_IP_PORT")
+    rpcClient, err = operator.NewAggregatorRpcClient(aggregatorIpPortAddr)
+    if (err != nil) {
+        log.Fatalf("Error creating RPC client: %v", err)
+    }
+
+    http.HandleFunc("/executeTask", executeTaskHandler)
+    log.Println("Starting operator server on port 8081...")
+    log.Fatal(http.ListenAndServe(":8081", nil))
 }
 
 func executeTaskHandler(w http.ResponseWriter, r *http.Request) {
-	var job JobCreatedEvent
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+    var job JobCreatedEvent
+    if (err := json.NewDecoder(r.Body).Decode(&job)) != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
 
-	log.Printf("Received task: %+v\n", job)
+    log.Printf("Received task: %+v\n", job)
 
-	// Perform task execution logic here
-	executeJob(job)
+    // Perform task execution logic here
+    executeJob(job.JobID)
 
-	w.WriteHeader(http.StatusOK)
+    w.WriteHeader(http.StatusOK)
 }
 
-func executeJob(job JobCreatedEvent) {
-	log.Printf("Executing job %d: fetching script from %s", job.JobID, job.JobURL)
-	response, err := http.Get(job.JobURL)
-	if err != nil {
-		log.Printf("Error fetching script for job %d: %v", job.JobID, err)
-		return
-	}
-	defer response.Body.Close()
+func executeJob(jobID uint32) {
+    script, err := ioutil.ReadFile("script.js")
+    if (err != nil) {
+        log.Printf("Error reading script file: %v", err)
+        return
+    }
 
-	if response.StatusCode != http.StatusOK {
-		log.Printf("Unexpected status code %d for job %d", response.StatusCode, job.JobID)
-		return
-	}
+    encodedData := string(script)
+    log.Printf("Encoded data from script: %s", encodedData)
 
-	// Use io.ReadAll to read response body
-	script, err := io.ReadAll(response.Body)
-	if err != nil {
-		log.Printf("Error reading script for job %d: %v", job.JobID, err)
-		return
-	}
-
-	executeScript(script)
+    signedData := signJobResult(encodedData)
+    sendSignedResultToAggregator(signedData, jobID)
 }
 
-func executeScript(script []byte) {
-	log.Println("Executing script...")
-	cmd := exec.Command("node", "-e", string(script))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Error executing script: %v", err)
-		return
-	}
-	log.Printf("Script output:\n%s", output)
+func signJobResult(encodedData string) string {
+    privateKey := os.Getenv("BLS_PRIVATE_KEY")
+
+    // Sign the encoded data using BLS
+    privKey := blst.SecretKey{}
+    privKey.DeserializeHexStr(privateKey)
+
+    message := []byte(encodedData)
+    signature := privKey.Sign(message, nil)
+
+    signedData := signature.Serialize()
+    return fmt.Sprintf("%x", signedData)
+}
+
+func sendSignedResultToAggregator(signedData string, jobID uint32) {
+    // Construct the signed task response
+    signedTaskResponse := &aggregator.SignedTaskResponse{
+        JobID:      jobID,
+        SignedData: signedData,
+    }
+
+    // Send the signed task response to the aggregator
+    rpcClient.SendSignedTaskResponseToAggregator(signedTaskResponse)
 }
